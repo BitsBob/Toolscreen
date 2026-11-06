@@ -554,7 +554,7 @@ bool WriteEmbeddedResourceToFile(WORD resourceId, const std::filesystem::path& d
     }
 
     const DWORD creationDisposition = overwriteExisting ? CREATE_ALWAYS : CREATE_NEW;
-    HANDLE fileHandle = CreateFileW(destination.c_str(), GENERIC_WRITE, 0, nullptr, creationDisposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE fileHandle = CreateFileW(destination.wstring().c_str(), GENERIC_WRITE, 0, nullptr, creationDisposition, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (fileHandle == INVALID_HANDLE_VALUE) {
         const DWORD lastError = GetLastError();
         if (!overwriteExisting && lastError == ERROR_FILE_EXISTS) {

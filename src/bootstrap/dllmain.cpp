@@ -16,6 +16,8 @@
 #include "common/i18n.h"
 #include "hooks/hook_chain.h"
 #include "common/utils.h"
+#include "common/atomic_shared_ptr.h"
+#include "common/gl_shader_compat.h"
 #include "version.h"
 #include "features/browser_overlay.h"
 #include "features/virtual_camera.h"
@@ -67,7 +69,7 @@ std::atomic<uint64_t> g_configSnapshotVersion{ 0 };
 // CONFIG SNAPSHOT (RCU) - Lock-free immutable config for reader threads
 // The mutable g_config is only touched by the GUI/main thread.
 // Reader threads call GetConfigSnapshot() for a safe, lock-free snapshot.
-static std::atomic<std::shared_ptr<const Config>> g_configSnapshot;
+static AtomicSharedPtr<const Config> g_configSnapshot;
 
 void PublishConfigSnapshot() {
     PublishConfigSnapshot(g_config);
@@ -227,7 +229,10 @@ std::atomic<int64_t> g_lastGuiToggleTimeMs{ 0 };
 
 enum CapturingState { NONE = 0, DISABLED = 1, NORMAL = 2 };
 std::atomic<CapturingState> g_capturingMousePos{ CapturingState::NONE };
-std::atomic<std::pair<int, int>> g_nextMouseXY{ std::make_pair(-1, -1) };
+// A plain aggregate: std::pair is not trivially copyable in every standard library, which
+// std::atomic requires.
+struct AtomicIntPair { int first; int second; };
+std::atomic<AtomicIntPair> g_nextMouseXY{ AtomicIntPair{ -1, -1 } };
 
 std::unordered_set<DWORD> g_hotkeyMainKeys;
 std::mutex g_hotkeyMainKeysMutex;
@@ -482,13 +487,13 @@ void ApplyPendingInitialInputState(HWND hwnd) {
     Log("Applied deferred input state: the game window reached the foreground without a focus message.");
 }
 
-template <typename T> bool CreateHookOrDie(LPVOID pTarget, LPVOID pDetour, T** ppOriginal, const char* hookName) {
+template <typename T, typename D> bool CreateHookOrDie(LPVOID pTarget, D pDetour, T** ppOriginal, const char* hookName) {
     if (pTarget == NULL) {
         std::string warnMsg = std::string("WARNING: ") + hookName + " function not found (NULL pointer)";
         Log(warnMsg);
         return false;
     }
-    if (MH_CreateHook(pTarget, pDetour, reinterpret_cast<void**>(ppOriginal)) != MH_OK) {
+    if (MH_CreateHook(pTarget, reinterpret_cast<LPVOID>(pDetour), reinterpret_cast<void**>(ppOriginal)) != MH_OK) {
         std::string errorMsg = std::string("ERROR: ") + hookName + " hook failed!";
         Log(errorMsg);
         return false;
@@ -2318,7 +2323,7 @@ static BOOL SetCursorPosHook_Impl(SETCURSORPOSPROC next, int X, int Y) {
     if (hwnd != NULL && !IsWindowInForegroundTree(hwnd)) {
         if (guiOpen || capturingState != CapturingState::NONE) {
             g_capturingMousePos.store(CapturingState::NONE, std::memory_order_release);
-            g_nextMouseXY.store(std::make_pair(-1, -1), std::memory_order_release);
+            g_nextMouseXY.store(AtomicIntPair{-1, -1}, std::memory_order_release);
             return TRUE;
         }
         return next(X, Y);
@@ -2358,7 +2363,7 @@ static BOOL SetCursorPosHook_Impl(SETCURSORPOSPROC next, int X, int Y) {
             }
         }
 
-        g_nextMouseXY.store(std::make_pair(centerX_abs, centerY_abs));
+        g_nextMouseXY.store(AtomicIntPair{centerX_abs, centerY_abs});
         return next(X, Y);
     }
 
@@ -2527,7 +2532,7 @@ static void GlfwSetInputModeHook_Impl(GLFWSETINPUTMODE next, void* window, int m
     if (guiOpen) {
         g_deferredGuiGlfwCursorMode.store(value, std::memory_order_release);
         UpdateGuiCursorRestoreState(value == GLFW_CURSOR_NORMAL);
-        g_nextMouseXY.store(std::make_pair(-1, -1), std::memory_order_release);
+        g_nextMouseXY.store(AtomicIntPair{-1, -1}, std::memory_order_release);
         g_capturingMousePos.store(CapturingState::NONE, std::memory_order_release);
         return;
     }
@@ -2913,7 +2918,7 @@ bool hkSdlSetWindowRelativeMouseMode(void* window, bool enabled) {
     if (g_showGui.load(std::memory_order_acquire)) {
         g_deferredGuiSdlRelativeMouseMode.store(enabled ? 1 : 0, std::memory_order_release);
         UpdateGuiCursorRestoreState(!enabled);
-        g_nextMouseXY.store(std::make_pair(-1, -1), std::memory_order_release);
+        g_nextMouseXY.store(AtomicIntPair{-1, -1}, std::memory_order_release);
         g_capturingMousePos.store(CapturingState::NONE, std::memory_order_release);
         return true;
     }
@@ -3908,6 +3913,7 @@ static BOOL SwapBuffersHook_Impl(WGLSWAPBUFFERS next, HDC hDc) {
                     return next(hDc);
                 }
                 g_openGlRenderContext = currentContext;
+                ToolscreenOnGlewInitialized();
                 g_glewLoaded.store(true, std::memory_order_release);
                 LogCategory("init", "[RENDER] GLEW Initialized successfully.");
                 g_welcomeToastVisible.store(true);
@@ -4593,6 +4599,257 @@ static void InstallGameWindowHooks(HWND gameWindow) {
     LogCategory("init", "Game-window hooks enabled.");
 }
 
+// Process-wide initialisation shared by the Windows DllMain and the macOS agent entry point
+// (ToolscreenMacProcessAttach). Returns false when Toolscreen cannot run (missing translations).
+static bool InitializeToolscreenProcess(HMODULE hModule) {
+    InstallGlobalExceptionHandlers();
+
+    LogCategory("init", "========================================");
+    LogCategory("init", "=== Toolscreen INITIALIZATION START ===");
+    LogCategory("init", "========================================");
+    PrintVersionToStdout();
+
+    // Create high-resolution waitable timer for FPS limiting (Windows 10 1803+)
+    g_highResTimer = CreateWaitableTimerExW(NULL,
+                                            NULL,
+                                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS
+    );
+    if (g_highResTimer) {
+        LogCategory("init", "High-resolution waitable timer created successfully for FPS limiting.");
+    } else {
+        Log("Warning: Failed to create high-resolution waitable timer. FPS limiting may be less precise.");
+    }
+
+    g_toolscreenPath = GetToolscreenPath();
+    if (!g_toolscreenPath.empty()) {
+        std::wstring logsDir = g_toolscreenPath + TS_WSEP L"logs";
+        std::wstring latestLogPath = logsDir + TS_WSEP L"latest.log";
+
+        if (GetFileAttributesW(latestLogPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            HANDLE hFile =
+                CreateFileW(latestLogPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                FILETIME lastWriteTime;
+                if (GetFileTime(hFile, NULL, NULL, &lastWriteTime)) {
+                    FILETIME localFileTime;
+                    FileTimeToLocalFileTime(&lastWriteTime, &localFileTime);
+                    SYSTEMTIME st;
+                    FileTimeToSystemTime(&localFileTime, &st);
+
+                    WCHAR timestamp[32];
+                    swprintf_s(timestamp, L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+                    std::wstring archivedLogPath = logsDir + TS_WSEP + timestamp + L".log";
+
+                    CloseHandle(hFile);
+
+                    if (GetFileAttributesW(archivedLogPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        for (int counter = 1; counter < 100; counter++) {
+                            std::wstring altPath = logsDir + TS_WSEP + timestamp + L"_" + std::to_wstring(counter) + L".log";
+                            if (GetFileAttributesW(altPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                                archivedLogPath = altPath;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!MoveFileW(latestLogPath.c_str(), archivedLogPath.c_str())) {
+                        Log("WARNING: Could not rename old log to " + WideToUtf8(archivedLogPath) +
+                            ", error code: " + std::to_string(GetLastError()));
+                    } else {
+                        // The managed log worker owns compression lifetime;
+                        // do not leave detached code running across DLL unload.
+                        QueueArchivedLogCompression(archivedLogPath);
+                    }
+                } else {
+                    CloseHandle(hFile);
+                }
+            }
+        }
+
+        if (AcquireLatestLogSession(logsDir, g_logSession)) {
+            {
+                std::lock_guard<std::mutex> lock(g_logFileMutex);
+                logFile.open(std::filesystem::path(g_logSession.logFilePath), std::ios_base::out | std::ios_base::trunc);
+                if (logFile.is_open()) {
+                    logFile << BuildLogSessionHeader(g_logSession);
+                    logFile.flush();
+                }
+            }
+
+            if (logFile.is_open()) {
+                StartLogThread();
+            } else {
+                ReleaseLatestLogSession(g_logSession);
+            }
+        }
+
+        g_modeFilePath = g_toolscreenPath + TS_WSEP L"mode.txt";
+    }
+    LogCategory("init", "--- DLL instance attached ---");
+    LogVersionInfo();
+    if (g_toolscreenPath.empty()) { Log("FATAL: Could not get toolscreen directory."); }
+    
+    g_gameVersion = GetGameVersionFromCommandLine();
+    // Layer activation is capability-based: it is inert for OpenGL-only
+    // clients and works when a launcher omits a Minecraft version flag.
+    VulkanHooks::EnableProcessLocalObsRedirectLayer(hModule);
+    GameVersion minVersion(1, 16, 1);
+    GameVersion maxVersion(1, 18, 2);
+
+    if (g_gameVersion.valid) {
+        bool inRange = IsVersionInRange(g_gameVersion, minVersion, maxVersion);
+
+        std::ostringstream oss;
+        oss << "Game version " << g_gameVersion.major << "." << g_gameVersion.minor << "." << g_gameVersion.patch;
+        if (inRange) {
+            oss << " is in supported range [1.16.1 - 1.18.2].";
+        } else {
+            oss << " is outside supported range [1.16.1 - 1.18.2].";
+        }
+        LogCategory("init", oss.str());
+    } else {
+        LogCategory("init", "No game version detected from command line.");
+    }
+
+    LoadConfig();
+
+    LoadLangs();
+    LogCategory("init", "Languages list loaded.");
+
+    if (!LoadTranslation(g_config.lang)) {
+        Log("FATAL: Could not load translations of " + g_config.lang);
+        return false;
+    }
+    LogCategory("init", "Loaded translations for language: " + g_config.lang);
+
+    WCHAR dir[MAX_PATH];
+    if (GetCurrentDirectoryW(MAX_PATH, dir) > 0) {
+        g_stateFilePath = std::wstring(dir) + TS_WSEP L"hermes" TS_WSEP L"state.json";
+        g_hermesAliveFilePath = std::wstring(dir) + TS_WSEP L"hermes" TS_WSEP L"alive";
+        g_stateOutputFilePath = std::wstring(dir) + TS_WSEP L"wpstateout.txt";
+        LogCategory("init", "Hermes state path: " + WideToUtf8(g_stateFilePath) +
+                                "; State Output path: " + WideToUtf8(g_stateOutputFilePath));
+
+        auto fileExists = [](const std::wstring& path) {
+            DWORD attrs = GetFileAttributesW(path.c_str());
+            return (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+        };
+        const bool hermesPresent = fileExists(g_stateFilePath);
+        const bool stateOutputPresent = fileExists(g_stateOutputFilePath);
+        g_isStateOutputAvailable.store(hermesPresent || stateOutputPresent, std::memory_order_release);
+        if (!hermesPresent && !stateOutputPresent) {
+            LogCategory("init",
+                        "WARNING: neither hermes/state.json nor wpstateout.txt found. Game-state hotkey restrictions "
+                        "will not apply until Hermes (recommended) or State Output is installed.");
+        }
+    } else {
+        Log("FATAL: Could not get current directory for state file path.");
+    }
+
+    // Use std::thread instead of CreateThread to ensure proper CRT per-thread
+    // initialization (locale facets, errno, etc.). CreateThread skips CRT init which
+    g_monitorThread = std::thread([]() { FileMonitorThread(nullptr); });
+    g_imageMonitorThread = std::thread([]() { ImageMonitorThread(nullptr); });
+    if (g_config.ninjabrainOverlay.enabled) {
+        StartNinjabrainClient();
+    }
+
+    StartWindowCaptureThread();
+    StartBrowserOverlayThread();
+    return true;
+}
+
+// Process-wide shutdown shared by DLL_PROCESS_DETACH and the macOS agent unload/exit path.
+// `processExiting` is true when the whole process is going away (other threads may be gone).
+static void ShutdownToolscreenProcess(bool processExiting) {
+    // We should do MINIMAL cleanup here. Windows will automatically clean up:
+    // - GPU resources (driver handles cleanup)
+    // - Thread handles
+    // 1. Other threads may still be running
+
+    g_isShuttingDown = true;
+    Log("DLL Detached. Performing minimal cleanup...");
+    GameTest::Shutdown();
+
+    if (g_highResTimer) {
+        CloseHandle(g_highResTimer);
+        g_highResTimer = NULL;
+    }
+
+    // ONLY save config and stop our own threads
+    // Do NOT touch hooks, GPU resources, or game state
+
+    // Restore original Windows mouse speed before exiting
+    RestoreWindowsMouseSpeed();
+
+    RestoreKeyRepeatSettings();
+
+    // lpReserved is non-NULL when the process is exiting (not a FreeLibrary). By then Windows has terminated
+    // every other thread, possibly while one held a lock, so only do what still matters: restore the system
+    // settings above, save the config and flush the log without waiting on locks a dead thread may own.
+    SaveConfigImmediate(processExiting);
+    Log("Config saved.");
+
+    if (processExiting) {
+        Log("DLL cleanup complete (process exit).");
+        FlushLogsBestEffort(500);
+        ReleaseLatestLogSession(g_logSession);
+        GameTest::RecordDetachComplete();
+        return;
+    }
+
+    // Stop monitoring threads
+    g_stopMonitoring = true;
+    if (g_monitorThread.joinable()) { g_monitorThread.join(); }
+
+    g_stopImageMonitoring = true;
+    if (g_imageMonitorThread.joinable()) { g_imageMonitorThread.join(); }
+
+    // Stop hook compatibility monitor thread
+    g_stopHookCompat.store(true, std::memory_order_release);
+    if (g_hookCompatThread.joinable()) { g_hookCompatThread.join(); }
+    StopNinjabrainClient();
+    StopSupportersFetch();
+
+    // Stop background threads
+    StopBrowserOverlayThread();
+    StopWindowCaptureThread();
+    StopLowLevelKeyboardHookThread();
+    VulkanHooks::Shutdown();
+
+    Log("Background threads stopped.");
+
+    // Clean up CPU-allocated memory that won't be freed by Windows
+    {
+        std::lock_guard<std::mutex> lock(g_decodedImagesMutex);
+        for (auto& decodedImg : g_decodedImagesQueue) {
+            if (decodedImg.data) { stbi_image_free(decodedImg.data); }
+        }
+        g_decodedImagesQueue.clear();
+    }
+
+    // DO NOT:
+    // - Delete GPU resources (Windows/driver handles this)
+
+    Log("DLL cleanup complete (minimal cleanup strategy).");
+
+    // Stop async logging thread and flush all pending logs
+    StopLogThread();
+    FlushLogs();
+
+    {
+        std::lock_guard<std::mutex> lock(g_logFileMutex);
+        if (logFile.is_open()) {
+            logFile.flush();
+            logFile.close();
+        }
+    }
+
+    ReleaseLatestLogSession(g_logSession);
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
@@ -4600,162 +4857,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)DllMain,
                            &g_hModule);
 
-        InstallGlobalExceptionHandlers();
-
-        LogCategory("init", "========================================");
-        LogCategory("init", "=== Toolscreen INITIALIZATION START ===");
-        LogCategory("init", "========================================");
-        PrintVersionToStdout();
-
-        // Create high-resolution waitable timer for FPS limiting (Windows 10 1803+)
-        g_highResTimer = CreateWaitableTimerExW(NULL,
-                                                NULL,
-                                                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                                TIMER_ALL_ACCESS
-        );
-        if (g_highResTimer) {
-            LogCategory("init", "High-resolution waitable timer created successfully for FPS limiting.");
-        } else {
-            Log("Warning: Failed to create high-resolution waitable timer. FPS limiting may be less precise.");
-        }
-
-        g_toolscreenPath = GetToolscreenPath();
-        if (!g_toolscreenPath.empty()) {
-            std::wstring logsDir = g_toolscreenPath + L"\\logs";
-            std::wstring latestLogPath = logsDir + L"\\latest.log";
-
-            if (GetFileAttributesW(latestLogPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                HANDLE hFile =
-                    CreateFileW(latestLogPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    FILETIME lastWriteTime;
-                    if (GetFileTime(hFile, NULL, NULL, &lastWriteTime)) {
-                        FILETIME localFileTime;
-                        FileTimeToLocalFileTime(&lastWriteTime, &localFileTime);
-                        SYSTEMTIME st;
-                        FileTimeToSystemTime(&localFileTime, &st);
-
-                        WCHAR timestamp[32];
-                        swprintf_s(timestamp, L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-                        std::wstring archivedLogPath = logsDir + L"\\" + timestamp + L".log";
-
-                        CloseHandle(hFile);
-
-                        if (GetFileAttributesW(archivedLogPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                            for (int counter = 1; counter < 100; counter++) {
-                                std::wstring altPath = logsDir + L"\\" + timestamp + L"_" + std::to_wstring(counter) + L".log";
-                                if (GetFileAttributesW(altPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                                    archivedLogPath = altPath;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (!MoveFileW(latestLogPath.c_str(), archivedLogPath.c_str())) {
-                            Log("WARNING: Could not rename old log to " + WideToUtf8(archivedLogPath) +
-                                ", error code: " + std::to_string(GetLastError()));
-                        } else {
-                            // The managed log worker owns compression lifetime;
-                            // do not leave detached code running across DLL unload.
-                            QueueArchivedLogCompression(archivedLogPath);
-                        }
-                    } else {
-                        CloseHandle(hFile);
-                    }
-                }
-            }
-
-            if (AcquireLatestLogSession(logsDir, g_logSession)) {
-                {
-                    std::lock_guard<std::mutex> lock(g_logFileMutex);
-                    logFile.open(std::filesystem::path(g_logSession.logFilePath), std::ios_base::out | std::ios_base::trunc);
-                    if (logFile.is_open()) {
-                        logFile << BuildLogSessionHeader(g_logSession);
-                        logFile.flush();
-                    }
-                }
-
-                if (logFile.is_open()) {
-                    StartLogThread();
-                } else {
-                    ReleaseLatestLogSession(g_logSession);
-                }
-            }
-
-            g_modeFilePath = g_toolscreenPath + L"\\mode.txt";
-        }
-        LogCategory("init", "--- DLL instance attached ---");
-        LogVersionInfo();
-        if (g_toolscreenPath.empty()) { Log("FATAL: Could not get toolscreen directory."); }
-        
-        g_gameVersion = GetGameVersionFromCommandLine();
-        // Layer activation is capability-based: it is inert for OpenGL-only
-        // clients and works when a launcher omits a Minecraft version flag.
-        VulkanHooks::EnableProcessLocalObsRedirectLayer(hModule);
-        GameVersion minVersion(1, 16, 1);
-        GameVersion maxVersion(1, 18, 2);
-
-        if (g_gameVersion.valid) {
-            bool inRange = IsVersionInRange(g_gameVersion, minVersion, maxVersion);
-
-            std::ostringstream oss;
-            oss << "Game version " << g_gameVersion.major << "." << g_gameVersion.minor << "." << g_gameVersion.patch;
-            if (inRange) {
-                oss << " is in supported range [1.16.1 - 1.18.2].";
-            } else {
-                oss << " is outside supported range [1.16.1 - 1.18.2].";
-            }
-            LogCategory("init", oss.str());
-        } else {
-            LogCategory("init", "No game version detected from command line.");
-        }
-
-        LoadConfig();
-
-        LoadLangs();
-        LogCategory("init", "Languages list loaded.");
-
-        if (!LoadTranslation(g_config.lang)) {
-            Log("FATAL: Could not load translations of " + g_config.lang);
-            return TRUE;
-        }
-        LogCategory("init", "Loaded translations for language: " + g_config.lang);
-
-        WCHAR dir[MAX_PATH];
-        if (GetCurrentDirectoryW(MAX_PATH, dir) > 0) {
-            g_stateFilePath = std::wstring(dir) + L"\\hermes\\state.json";
-            g_hermesAliveFilePath = std::wstring(dir) + L"\\hermes\\alive";
-            g_stateOutputFilePath = std::wstring(dir) + L"\\wpstateout.txt";
-            LogCategory("init", "Hermes state path: " + WideToUtf8(g_stateFilePath) +
-                                    "; State Output path: " + WideToUtf8(g_stateOutputFilePath));
-
-            auto fileExists = [](const std::wstring& path) {
-                DWORD attrs = GetFileAttributesW(path.c_str());
-                return (attrs != INVALID_FILE_ATTRIBUTES) && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
-            };
-            const bool hermesPresent = fileExists(g_stateFilePath);
-            const bool stateOutputPresent = fileExists(g_stateOutputFilePath);
-            g_isStateOutputAvailable.store(hermesPresent || stateOutputPresent, std::memory_order_release);
-            if (!hermesPresent && !stateOutputPresent) {
-                LogCategory("init",
-                            "WARNING: neither hermes/state.json nor wpstateout.txt found. Game-state hotkey restrictions "
-                            "will not apply until Hermes (recommended) or State Output is installed.");
-            }
-        } else {
-            Log("FATAL: Could not get current directory for state file path.");
-        }
-
-        // Use std::thread instead of CreateThread to ensure proper CRT per-thread
-        // initialization (locale facets, errno, etc.). CreateThread skips CRT init which
-        g_monitorThread = std::thread([]() { FileMonitorThread(nullptr); });
-        g_imageMonitorThread = std::thread([]() { ImageMonitorThread(nullptr); });
-        if (g_config.ninjabrainOverlay.enabled) {
-            StartNinjabrainClient();
-        }
-
-        StartWindowCaptureThread();
-        StartBrowserOverlayThread();
+        if (!InitializeToolscreenProcess(hModule)) { return TRUE; }
 
         if (MH_Initialize() != MH_OK) {
             Log("ERROR: MH_Initialize() failed!");
@@ -4802,91 +4904,54 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         SaveOriginalKeyRepeatSettings();
 
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        // We should do MINIMAL cleanup here. Windows will automatically clean up:
-        // - GPU resources (driver handles cleanup)
-        // - Thread handles
-        // 1. Other threads may still be running
-
-        g_isShuttingDown = true;
-        Log("DLL Detached. Performing minimal cleanup...");
-        GameTest::Shutdown();
-
-        if (g_highResTimer) {
-            CloseHandle(g_highResTimer);
-            g_highResTimer = NULL;
-        }
-
-        // ONLY save config and stop our own threads
-        // Do NOT touch hooks, GPU resources, or game state
-
-        // Restore original Windows mouse speed before exiting
-        RestoreWindowsMouseSpeed();
-
-        RestoreKeyRepeatSettings();
-
-        // lpReserved is non-NULL when the process is exiting (not a FreeLibrary). By then Windows has terminated
-        // every other thread, possibly while one held a lock, so only do what still matters: restore the system
-        // settings above, save the config and flush the log without waiting on locks a dead thread may own.
-        const bool processExiting = lpReserved != nullptr;
-        SaveConfigImmediate(processExiting);
-        Log("Config saved.");
-
-        if (processExiting) {
-            Log("DLL cleanup complete (process exit).");
-            FlushLogsBestEffort(500);
-            ReleaseLatestLogSession(g_logSession);
-            GameTest::RecordDetachComplete();
-            return TRUE;
-        }
-
-        // Stop monitoring threads
-        g_stopMonitoring = true;
-        if (g_monitorThread.joinable()) { g_monitorThread.join(); }
-
-        g_stopImageMonitoring = true;
-        if (g_imageMonitorThread.joinable()) { g_imageMonitorThread.join(); }
-
-        // Stop hook compatibility monitor thread
-        g_stopHookCompat.store(true, std::memory_order_release);
-        if (g_hookCompatThread.joinable()) { g_hookCompatThread.join(); }
-        StopNinjabrainClient();
-        StopSupportersFetch();
-
-        // Stop background threads
-        StopBrowserOverlayThread();
-        StopWindowCaptureThread();
-        StopLowLevelKeyboardHookThread();
-        VulkanHooks::Shutdown();
-
-        Log("Background threads stopped.");
-
-        // Clean up CPU-allocated memory that won't be freed by Windows
-        {
-            std::lock_guard<std::mutex> lock(g_decodedImagesMutex);
-            for (auto& decodedImg : g_decodedImagesQueue) {
-                if (decodedImg.data) { stbi_image_free(decodedImg.data); }
-            }
-            g_decodedImagesQueue.clear();
-        }
-
-        // DO NOT:
-        // - Delete GPU resources (Windows/driver handles this)
-
-        Log("DLL cleanup complete (minimal cleanup strategy).");
-
-        // Stop async logging thread and flush all pending logs
-        StopLogThread();
-        FlushLogs();
-
-        {
-            std::lock_guard<std::mutex> lock(g_logFileMutex);
-            if (logFile.is_open()) {
-                logFile.flush();
-                logFile.close();
-            }
-        }
-
-        ReleaseLatestLogSession(g_logSession);
+        ShutdownToolscreenProcess(lpReserved != nullptr);
     }
     return TRUE;
 }
+
+#if defined(TOOLSCREEN_MACOS)
+// ---------------------------------------------------------------------------------------------
+// macOS entry points (see src/platform/mac/mac_hooks.cpp).
+//
+// On macOS the hooks are installed by interposing LWJGL's own symbol lookups instead of patching
+// opengl32.dll exports, so every call that reaches these functions was made by Minecraft. The
+// JIT-caller filtering the Windows detours need (to ignore driver/overlay callers of the shared
+// export) therefore does not apply.
+// ---------------------------------------------------------------------------------------------
+void APIENTRY ToolscreenMac_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
+    if (!oglViewport) return;
+    if (g_internalViewportCall) {
+        oglViewport(x, y, width, height);
+        return;
+    }
+    ViewportHook_Impl(oglViewport, x, y, width, height);
+}
+
+void APIENTRY ToolscreenMac_glBindTexture(GLenum target, GLuint texture) { BindTextureHook_Impl(oglBindTexture, target, texture); }
+
+void APIENTRY ToolscreenMac_glBindFramebuffer(GLenum target, GLuint framebuffer) {
+    BindFramebufferHook_Impl(oglBindFramebuffer, target, framebuffer);
+}
+
+// Called from the JVMTI agent entry point once the dylib is loaded into Minecraft's JVM.
+bool ToolscreenMacProcessAttach(HMODULE hModule) {
+    g_hModule = hModule;
+    GameTest::InitializeFromEnvironment();
+    if (!InitializeToolscreenProcess(hModule)) return false;
+    SaveOriginalWindowsMouseSpeed();
+    SaveOriginalKeyRepeatSettings();
+    g_stopHookCompat.store(false, std::memory_order_release);
+    return true;
+}
+
+void ToolscreenMacProcessDetach(bool /*processExiting*/) {
+    static std::atomic<bool> s_detached{ false };
+    if (s_detached.exchange(true)) return;
+    // Unlike Windows (where ExitProcess has already terminated every other thread before
+    // DLL_PROCESS_DETACH), Toolscreen's threads are still running when the JVM unloads the agent or
+    // the process reaches atexit, and libc++ terminates on destroying a joinable std::thread. Take the
+    // full shutdown path so every worker is stopped and joined first.
+    StopLogicThread();
+    ShutdownToolscreenProcess(false);
+}
+#endif

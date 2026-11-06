@@ -874,7 +874,7 @@ if (BeginSelectableSettingsTopTabItem(trc("tabs.modes"))) {
                         if (!ov.path.empty()) {
                             std::wstring ovWpath = Utf8ToWide(ov.path);
                             std::wstring ovFinalPath = (PathIsRelativeW(ovWpath.c_str()) && !g_toolscreenPath.empty())
-                                ? (g_toolscreenPath + L"\\" + ovWpath) : ovWpath;
+                                ? (g_toolscreenPath + TS_WSEP + ovWpath) : ovWpath;
                             if (std::filesystem::exists(ovFinalPath)) {
                                 ImGui::SameLine();
                                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), trc("label.file_exists"));

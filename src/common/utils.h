@@ -5,6 +5,8 @@
 #endif
 #include <GL/glew.h>
 
+#include "common/path_sep.h"
+
 #include <atomic>
 #include <chrono>
 #include <fstream>

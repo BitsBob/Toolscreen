@@ -28,15 +28,15 @@ namespace {
 std::mutex g_profilesMutex;
 
 static std::wstring GetProfilesDir() {
-    return g_toolscreenPath + L"\\profiles";
+    return g_toolscreenPath + TS_WSEP L"profiles";
 }
 
 static std::wstring GetProfilePath(const std::string& name) {
-    return GetProfilesDir() + L"\\" + Utf8ToWide(name) + L".toml";
+    return GetProfilesDir() + TS_WSEP + Utf8ToWide(name) + L".toml";
 }
 
 static std::wstring GetProfilesConfigPath() {
-    return g_toolscreenPath + L"\\profiles.toml";
+    return g_toolscreenPath + TS_WSEP L"profiles.toml";
 }
 
 static bool ProfileNamesEqual(const std::string& a, const std::string& b) {

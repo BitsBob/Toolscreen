@@ -2604,7 +2604,7 @@ void RenderConfigErrorGUI() {
 
         if (ImGui::Button(trc("button.copy_debug_info"))) {
             std::string configContent = "ERROR: Could not read config.toml.";
-            std::wstring configPath = g_toolscreenPath + L"\\config.toml";
+            std::wstring configPath = g_toolscreenPath + TS_WSEP L"config.toml";
             std::ifstream f(std::filesystem::path(configPath), std::ios::binary);
             if (f.is_open()) {
                 std::ostringstream ss;

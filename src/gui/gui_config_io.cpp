@@ -298,7 +298,7 @@ void SaveConfig() {
         return;
     }
 
-    std::wstring configPath = g_toolscreenPath + L"\\config.toml";
+    std::wstring configPath = g_toolscreenPath + TS_WSEP L"config.toml";
     try {
         Config sharedSnapshot;
         Config profileSnapshot;
@@ -381,7 +381,7 @@ void SaveConfigImmediate(bool processExiting) {
         return;
     }
 
-    std::wstring configPath = g_toolscreenPath + L"\\config.toml";
+    std::wstring configPath = g_toolscreenPath + TS_WSEP L"config.toml";
     try {
         Log("SaveConfigImmediate: Starting config copy...");
         Config sharedSnapshot;
@@ -525,7 +525,7 @@ void LoadConfig() {
         return;
     }
 
-    std::wstring configPath = g_toolscreenPath + L"\\config.toml";
+    std::wstring configPath = g_toolscreenPath + TS_WSEP L"config.toml";
 
     if (!std::filesystem::exists(configPath)) {
         Log("config.toml not found. Writing a default config file.");
@@ -543,8 +543,8 @@ void LoadConfig() {
     }
 
     RemoveStaleConfigTempFiles(g_toolscreenPath);
-    RemoveStaleConfigTempFiles(g_toolscreenPath + L"\\profiles");
-    ExtractBundledFontAssets(std::filesystem::path(g_toolscreenPath), &LoadConfig);
+    RemoveStaleConfigTempFiles(g_toolscreenPath + TS_WSEP L"profiles");
+    ExtractBundledFontAssets(std::filesystem::path(g_toolscreenPath), reinterpret_cast<const void*>(&LoadConfig));
     LoadSystemFontAssets();
 
     try {

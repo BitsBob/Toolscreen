@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include "common/gl_shader_compat.h"
 
 static std::recursive_mutex s_imguiContextMutex;
 
@@ -484,7 +485,7 @@ void InitializeImGuiContext(HWND hwnd) {
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         ImGui_ImplWin32_Init(hwnd);
-        ImGui_ImplOpenGL3_Init("#version 330");
+        ImGui_ImplOpenGL3_Init(ToolscreenImGuiGlslVersion());
         ConfigureImGuiFontsAndStyle(ComputeGuiScaleFactorFromCachedWindowSize());
         s_mainThreadImGuiHwnd = hwnd;
         s_mainThreadImGuiGlContext = currentGlContext;
@@ -1049,7 +1050,7 @@ static bool LoadIndicatorTextureFromFile(const std::string& path, RebindIndicato
 
     std::string resolvedPath = path;
     if (!g_toolscreenPath.empty() && !std::filesystem::path(path).is_absolute()) {
-        resolvedPath = WideToUtf8(g_toolscreenPath) + "\\" + path;
+        resolvedPath = WideToUtf8(g_toolscreenPath) + TS_SEP + path;
     }
 
     stbi_set_flip_vertically_on_load_thread(0);
@@ -1716,7 +1717,7 @@ void HandleConfigLoadFailed(HDC hDc, BOOL (*oWglSwapBuffers)(HDC)) {
         ImGui_ImplWin32_Init(g_minecraftHwnd.load());
         // The renderer backend must be initialized before the font atlas is built: it sets
         // ImGuiBackendFlags_RendererHasTextures, and ImGui asserts if Build() ran before that flag existed.
-        ImGui_ImplOpenGL3_Init("#version 330");
+        ImGui_ImplOpenGL3_Init(ToolscreenImGuiGlslVersion());
         ConfigureImGuiFontsAndStyle(ComputeGuiScaleFactorFromCachedWindowSize() * 1.25f);
     }
 

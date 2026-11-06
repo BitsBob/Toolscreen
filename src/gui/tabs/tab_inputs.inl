@@ -100,7 +100,7 @@ if (BeginSelectableSettingsTopTabItem(trc("tabs.inputs"))) {
                         if (g_toolscreenPath.empty()) {
                             Log("ERROR: Unable to open custom cursor folder because toolscreen path is empty.");
                         } else {
-                            std::wstring cursorsPath = g_toolscreenPath + L"\\cursors";
+                            std::wstring cursorsPath = g_toolscreenPath + TS_WSEP L"cursors";
                             std::error_code ec;
                             if (!std::filesystem::exists(cursorsPath, ec)) { std::filesystem::create_directories(cursorsPath, ec); }
 

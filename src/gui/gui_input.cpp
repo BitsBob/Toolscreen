@@ -219,7 +219,7 @@ std::string ValidateImageFile(const std::string& path, const std::wstring& tools
     std::wstring final_path;
     std::wstring image_wpath = Utf8ToWide(path);
     if (PathIsRelativeW(image_wpath.c_str()) && !toolscreenPath.empty()) {
-        final_path = toolscreenPath + L"\\" + image_wpath;
+        final_path = toolscreenPath + TS_WSEP + image_wpath;
     } else {
         final_path = image_wpath;
     }

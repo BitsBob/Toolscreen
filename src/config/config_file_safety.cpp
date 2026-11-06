@@ -232,7 +232,7 @@ std::string DisplayNameFor(const std::wstring& path) {
     if (!g_toolscreenPath.empty()) {
         std::error_code error;
         const std::filesystem::path relative = std::filesystem::relative(std::filesystem::path(path), std::filesystem::path(g_toolscreenPath), error);
-        if (!error && !relative.empty() && relative.native().rfind(L"..", 0) != 0) {
+        if (!error && !relative.empty() && relative.wstring().rfind(L"..", 0) != 0) {
             return WideToUtf8(relative.wstring());
         }
     }
@@ -286,7 +286,7 @@ bool TryAccept(const TomlSourceAcceptor& accept, const std::string& source, std:
 }
 
 std::wstring GetConfigBackupDirectory() {
-    return g_toolscreenPath + L"\\backups";
+    return g_toolscreenPath + TS_WSEP L"backups";
 }
 
 long long SnapshotTimestampFromFileName(const std::wstring& fileName) {
@@ -532,7 +532,7 @@ void BackupConfigFile() {
         return;
     }
 
-    const std::wstring configPath = g_toolscreenPath + L"\\config.toml";
+    const std::wstring configPath = g_toolscreenPath + TS_WSEP L"config.toml";
     std::string contents;
     if (ReadFileBytes(configPath, contents) != ReadResult::Ok) {
         Log("Config file could not be read, skipping backup.");
@@ -556,7 +556,7 @@ void BackupConfigFile() {
 
     const auto timestamp =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    const std::wstring backupPath = backupDir + L"\\config_" + std::to_wstring(timestamp) + L".toml";
+    const std::wstring backupPath = backupDir + TS_WSEP L"config_" + std::to_wstring(timestamp) + L".toml";
     if (!WriteBytesAtomically(backupPath, contents)) {
         Log("Failed to backup config file. Error code: " + std::to_string(GetLastError()));
         return;

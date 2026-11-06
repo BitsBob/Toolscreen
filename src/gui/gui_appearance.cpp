@@ -1,6 +1,7 @@
 #include "gui.h"
 
 #include "config/config_toml.h"
+#include "common/path_sep.h"
 
 #include <atomic>
 #include <filesystem>
@@ -424,7 +425,7 @@ void SaveTheme() {
         return;
     }
 
-    std::wstring themePath = g_toolscreenPath + L"\\theme.toml";
+    std::wstring themePath = g_toolscreenPath + TS_WSEP L"theme.toml";
     try {
         toml::table tbl;
         tbl.insert_or_assign("theme", g_config.appearance.theme);
@@ -464,7 +465,7 @@ void LoadTheme() {
         return;
     }
 
-    std::wstring themePath = g_toolscreenPath + L"\\theme.toml";
+    std::wstring themePath = g_toolscreenPath + TS_WSEP L"theme.toml";
     try {
         toml::table tbl;
         std::string loadError;

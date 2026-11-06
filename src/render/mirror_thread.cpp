@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <unordered_map>
+#include "common/gl_shader_compat.h"
 
 // Updated by UpdateMirrorCaptureConfigs (logic thread) and read by SwapBuffers hook.
 std::atomic<int> g_activeMirrorCaptureCount{ 0 };
@@ -764,7 +765,9 @@ static MT_FilterPassthroughShaderLocs mt_filterPassthroughShaderLocs;
 
 static GLuint MT_CompileShader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, NULL);
+    const std::string preparedSource = ToolscreenPrepareShaderSource(type, source);
+    const char* preparedSourcePtr = preparedSource.c_str();
+    glShaderSource(shader, 1, &preparedSourcePtr, NULL);
     glCompileShader(shader);
     GLint ok;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
@@ -789,6 +792,7 @@ static GLuint MT_CreateShaderProgram(const char* vertSrc, const char* fragSrc) {
     GLuint p = glCreateProgram();
     glAttachShader(p, vs);
     glAttachShader(p, fs);
+    ToolscreenBindShaderAttribLocations(p, vertSrc);
     glLinkProgram(p);
     glDeleteShader(vs);
     glDeleteShader(fs);

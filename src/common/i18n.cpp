@@ -101,22 +101,22 @@ void LoadLangs() {
 
         HRSRC resSrc = FindResourceW(hModule, MAKEINTRESOURCEW(IDR_LANG_LANGS), RT_RCDATA);
         if (!resSrc) {
-            throw std::exception("FindResourceW failed");
+            throw std::runtime_error("FindResourceW failed");
         }
 
         HGLOBAL resHandle = LoadResource(hModule, resSrc);
         if (!resHandle) {
-            throw std::exception("LoadResource failed");
+            throw std::runtime_error("LoadResource failed");
         }
 
         auto* const resPtr = LockResource(resHandle);
         if (!resPtr) {
-            throw std::exception("LockResource failed");
+            throw std::runtime_error("LockResource failed");
         }
 
         const auto resSize = SizeofResource(hModule, resSrc);
         if (resSize == 0) {
-            throw std::exception("SizeofResource failed");
+            throw std::runtime_error("SizeofResource failed");
         }
 
         g_langsJson = nlohmann::json::parse((const char*)resPtr, (const char*)resPtr + resSize);

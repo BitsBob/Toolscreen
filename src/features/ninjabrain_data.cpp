@@ -1,12 +1,14 @@
 #include "ninjabrain_data.h"
 
+#include "common/atomic_shared_ptr.h"
+
 #include <atomic>
 #include <chrono>
 #include <mutex>
 
 namespace {
 
-std::atomic<std::shared_ptr<const NinjabrainData>> g_ninjabrainDataSnapshot{
+AtomicSharedPtr<const NinjabrainData> g_ninjabrainDataSnapshot{
 	std::make_shared<const NinjabrainData>()
 };
 std::mutex g_ninjabrainDataWriteMutex;

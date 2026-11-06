@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <optional>
+#include "common/gl_shader_compat.h"
 
 extern std::atomic<GLuint> g_cachedGameTextureId;
 
@@ -826,13 +827,13 @@ std::wstring GetArchiveTimestampString(const std::wstring& logFilePath) {
 std::wstring MakeUniqueArchivedLogPath(const std::wstring& logsDirectory, const std::wstring& timestamp) {
     for (int counter = 0; counter < 1000; ++counter) {
         const std::wstring suffix = counter == 0 ? L"" : (L"_" + std::to_wstring(counter));
-        const std::wstring archivedLogPath = logsDirectory + L"\\" + timestamp + suffix + L".log";
+        const std::wstring archivedLogPath = logsDirectory + TS_WSEP + timestamp + suffix + L".log";
         if (!PathExists(archivedLogPath) && !PathExists(archivedLogPath + L".gz")) {
             return archivedLogPath;
         }
     }
 
-    return logsDirectory + L"\\" + timestamp + L"_" + std::to_wstring(GetTickCount64()) + L".log";
+    return logsDirectory + TS_WSEP + timestamp + L"_" + std::to_wstring(GetTickCount64()) + L".log";
 }
 
 std::wstring ArchiveLatestLogFile(const std::wstring& logsDirectory, const std::wstring& logFilePath) {
@@ -850,7 +851,7 @@ std::wstring ArchiveLatestLogFile(const std::wstring& logsDirectory, const std::
 
 void CleanupStaleLatestLogs(const std::wstring& logsDirectory) {
     for (const size_t slotIndex : GatherKnownLatestLogSlots(logsDirectory)) {
-        const std::wstring logFilePath = logsDirectory + L"\\" + BuildLatestLogFilename(slotIndex);
+        const std::wstring logFilePath = logsDirectory + TS_WSEP + BuildLatestLogFilename(slotIndex);
         const std::wstring ownerFilePath = BuildOwnerFilePath(logFilePath);
         const OwnerFileState ownerState = InspectOwnerFile(ownerFilePath);
         if (ownerState.live) {
@@ -871,7 +872,7 @@ void CleanupStaleLatestLogs(const std::wstring& logsDirectory) {
 std::vector<LogInstanceInfo> EnumerateLiveLogInstances(const std::wstring& logsDirectory) {
     std::vector<LogInstanceInfo> instances;
     for (const size_t slotIndex : GatherKnownLatestLogSlots(logsDirectory)) {
-        const std::wstring logFilePath = logsDirectory + L"\\" + BuildLatestLogFilename(slotIndex);
+        const std::wstring logFilePath = logsDirectory + TS_WSEP + BuildLatestLogFilename(slotIndex);
         const OwnerFileState ownerState = InspectOwnerFile(BuildOwnerFilePath(logFilePath));
         if (!ownerState.live) {
             continue;
@@ -941,7 +942,7 @@ bool AcquireLatestLogSession(const std::wstring& logsDirectory, LogSession& outS
 
     for (size_t slotIndex = 0; slotIndex < 1024; ++slotIndex) {
         session.slotIndex = slotIndex;
-        session.logFilePath = logsDirectory + L"\\" + BuildLatestLogFilename(slotIndex);
+        session.logFilePath = logsDirectory + TS_WSEP + BuildLatestLogFilename(slotIndex);
         session.ownerFilePath = BuildOwnerFilePath(session.logFilePath);
 
         const OwnerFileState ownerState = InspectOwnerFile(session.ownerFilePath);
@@ -1495,14 +1496,14 @@ void InstallGlobalExceptionHandlers() {
 std::wstring GetToolscreenPath() {
     WCHAR currentDir[MAX_PATH];
     if (GetCurrentDirectoryW(MAX_PATH, currentDir)) {
-        std::wstring localPath = std::wstring(currentDir) + L"\\toolscreen";
+        std::wstring localPath = std::wstring(currentDir) + TS_WSEP L"toolscreen";
         DWORD attrs = GetFileAttributesW(localPath.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) { return localPath; }
     }
 
     WCHAR userProfile[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, userProfile))) {
-        std::wstring path = std::wstring(userProfile) + L"\\.config\\toolscreen";
+        std::wstring path = std::wstring(userProfile) + TS_WSEP L".config" TS_WSEP L"toolscreen";
         if (SHCreateDirectoryExW(NULL, path.c_str(), NULL) == ERROR_SUCCESS || GetLastError() == ERROR_ALREADY_EXISTS) { return path; }
     }
     return L"";
@@ -2127,7 +2128,9 @@ ModeViewportInfo GetCurrentModeViewport() {
 
 GLuint CompileShader(GLenum type, const char* source) {
     GLuint shader = glCreateShader(type);
-    glShaderSource(shader, 1, &source, NULL);
+    const std::string preparedSource = ToolscreenPrepareShaderSource(type, source);
+    const char* preparedSourcePtr = preparedSource.c_str();
+    glShaderSource(shader, 1, &preparedSourcePtr, NULL);
     glCompileShader(shader);
     GLint ok;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
@@ -2149,6 +2152,7 @@ GLuint CreateShaderProgram(const char* vert, const char* frag) {
     GLuint p = glCreateProgram();
     glAttachShader(p, v);
     glAttachShader(p, f);
+    ToolscreenBindShaderAttribLocations(p, vert);
     glLinkProgram(p);
     GLint ok;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
@@ -2185,7 +2189,7 @@ void LoadImageAsync(DecodedImageData::Type type, std::string id, std::string pat
                 std::wstring final_path;
                 std::wstring image_wpath = Utf8ToWide(path);
                 if (PathIsRelativeW(image_wpath.c_str()) && !toolscreenPath.empty()) {
-                    final_path = toolscreenPath + L"\\" + image_wpath;
+                    final_path = toolscreenPath + TS_WSEP + image_wpath;
                 } else {
                     final_path = image_wpath;
                 }
@@ -2603,7 +2607,7 @@ DWORD WINAPI ImageMonitorThread(LPVOID lpParam) {
                 if (img.path.empty()) continue;
 
                 std::wstring final_path = Utf8ToWide(img.path);
-                if (PathIsRelativeW(final_path.c_str())) { final_path = g_toolscreenPath + L"\\" + final_path; }
+                if (PathIsRelativeW(final_path.c_str())) { final_path = g_toolscreenPath + TS_WSEP + final_path; }
 
                 HANDLE hFile = CreateFileW(final_path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
                 if (hFile == INVALID_HANDLE_VALUE) continue;

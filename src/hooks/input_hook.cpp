@@ -1586,7 +1586,7 @@ static InputHandlerResult ApplySettingsGuiToggle(HWND hWnd, bool isEscape) {
             true, std::memory_order_release);
         if (!g_toolscreenPath.empty()) {
             const std::wstring flagPath =
-                g_toolscreenPath + L"\\has_opened";
+                g_toolscreenPath + TS_WSEP L"has_opened";
             const HANDLE file = CreateFileW(
                 flagPath.c_str(), GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL, NULL);

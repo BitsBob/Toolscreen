@@ -734,12 +734,12 @@ void TestConfigSaveRoundTrip() {
         SaveConfigImmediate();
         return g_profilesConfig.activeProfile;
     });
-    const std::wstring configPath = g_toolscreenPath + L"\\config.toml";
+    const std::wstring configPath = g_toolscreenPath + TS_WSEP L"config.toml";
     Require(std::filesystem::exists(std::filesystem::path(configPath)), "config.toml was not written to " + WideToUtf8(configPath) + ".");
     Config sharedConfig;
     Require(LoadConfigFromTomlFile(configPath, sharedConfig), "The saved config.toml could not be parsed.");
 
-    const std::wstring profilePath = g_toolscreenPath + L"\\profiles\\" + Utf8ToWide(activeProfile) + L".toml";
+    const std::wstring profilePath = g_toolscreenPath + TS_WSEP L"profiles" TS_WSEP + Utf8ToWide(activeProfile) + L".toml";
     Config profileConfig;
     Require(LoadConfigFromTomlFile(profilePath, profileConfig),
             "The active profile " + WideToUtf8(profilePath) + " could not be parsed.");
@@ -767,7 +767,7 @@ TestOverlay LoadTestOverlay(const wchar_t* fileName) {
     if (!std::filesystem::exists(overlayPath)) Skip("Test overlay " + WideToUtf8(overlayPath.wstring()) + " is not staged.");
 
     TestOverlay overlay;
-    overlay.module = LoadLibraryW(overlayPath.c_str());
+    overlay.module = LoadLibraryW(overlayPath.wstring().c_str());
     Require(overlay.module != NULL, "Could not load " + WideToUtf8(overlayPath.wstring()) + ".");
     overlay.detour = reinterpret_cast<void*>(GetProcAddress(overlay.module, "GameTestOverlaySwapBuffers"));
     overlay.callCount = reinterpret_cast<LONG (*)()>(GetProcAddress(overlay.module, "GameTestOverlayCallCount"));
@@ -1319,7 +1319,7 @@ void TestEyeZoomScreenshots() {
         file.bfType = 0x4D42;
         file.bfOffBits = sizeof(file) + sizeof(info);
         file.bfSize = file.bfOffBits + static_cast<DWORD>(rgba.size());
-        std::ofstream out(std::filesystem::path(dir + L"\\" + name + L".bmp"), std::ios::binary);
+        std::ofstream out(std::filesystem::path(dir + TS_WSEP + name + L".bmp"), std::ios::binary);
         out.write(reinterpret_cast<const char*>(&file), sizeof(file));
         out.write(reinterpret_cast<const char*>(&info), sizeof(info));
         out.write(reinterpret_cast<const char*>(rgba.data()), static_cast<std::streamsize>(rgba.size()));
@@ -1424,6 +1424,9 @@ void TestVulkanMirrorContentDetection() {
 }
 
 void TestObsPassReusesScreenImGuiFrame() {
+#if defined(TOOLSCREEN_MACOS)
+    Skip("OBS game-capture redirection is Windows-only; OBS on macOS captures the presented window.");
+#endif
     WaitUntil([] { return GetRenderBackend() != RenderBackend::Unknown; }, std::chrono::seconds(20));
     if (GetRenderBackend() != RenderBackend::OpenGL) Skip("The same-thread OBS compose pass is the OpenGL path.");
     if (!IsResolutionChangeSupported(g_gameVersion)) Skip("Modes are not supported on this game version.");
@@ -1531,7 +1534,7 @@ void TestConfigRecoveredFromBackup() {
                                           std::to_string(snapshot->fpsLimit) + ", expected 77).");
 
     Config onDisk;
-    Require(LoadConfigFromTomlFile(g_toolscreenPath + L"\\config.toml", onDisk) && onDisk.fpsLimit == 77,
+    Require(LoadConfigFromTomlFile(g_toolscreenPath + TS_WSEP L"config.toml", onDisk) && onDisk.fpsLimit == 77,
             "The backup was not written back to config.toml.");
     Require(std::filesystem::exists(std::filesystem::path(g_toolscreenPath) / Utf8ToWide(configNotice->movedAsideAs)),
             "The damaged config.toml was not kept next to the restored file.");
