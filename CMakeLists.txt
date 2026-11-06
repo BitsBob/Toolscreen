@@ -23,7 +23,11 @@ set(TOOLSCREEN_LIBLOGGER_FILE_DESCRIPTION "LibLogger")
 set(TOOLSCREEN_INSTALLER_FILE_DESCRIPTION "Toolscreen installer")
 set(TOOLSCREEN_DOWNLOADER_FILE_DESCRIPTION "Toolscreen downloader")
 
-project(Toolscreen VERSION ${TOOLSCREEN_VERSION} LANGUAGES C CXX RC)
+if(APPLE)
+    project(Toolscreen VERSION ${TOOLSCREEN_VERSION} LANGUAGES C CXX OBJC OBJCXX)
+else()
+    project(Toolscreen VERSION ${TOOLSCREEN_VERSION} LANGUAGES C CXX RC)
+endif()
 
 include(CTest)
 
@@ -37,8 +41,15 @@ configure_file(
     @ONLY
 )
 
+if(APPLE)
+    # The macOS port lives in its own build description so the Windows build below stays byte-for-byte
+    # identical to upstream.
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/ToolscreenMacOS.cmake")
+    return()
+endif()
+
 if(NOT WIN32)
-    message(FATAL_ERROR "Toolscreen only supports Windows builds.")
+    message(FATAL_ERROR "Toolscreen only supports Windows and macOS builds.")
 endif()
 
 option(TOOLSCREEN_ENABLE_JAR_PACKAGING "Enable the EasyInjectBundled jar packaging target." ON)

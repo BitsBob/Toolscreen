@@ -6,12 +6,16 @@
 !README.md
 !ToolscreenVersion.cmake
 !build.bat
+!build-macos.sh
+!cmake/
+!cmake/**
 !scripts/
 !scripts/verify_pe_metadata.ps1
 !scripts/**
 !docs
 !docs/images/
 !docs/images/screenshot.png
+!docs/macos.md
 !lang
 !lang/langs.json
 !lang/en.json

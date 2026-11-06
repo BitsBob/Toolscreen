@@ -1,0 +1,282 @@
+# macOS build of Toolscreen.
+#
+# Produces libToolscreen.dylib, a JVMTI agent that is loaded into Minecraft's JVM with
+#   -agentpath:/path/to/libToolscreen.dylib
+# (see docs/macos.md). Shared game/render/GUI logic is compiled from the same sources as the
+# Windows DLL; Win32 APIs are provided by the compatibility layer in src/platform/mac.
+
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.3" CACHE STRING "Minimum macOS version" FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_OBJCXX_STANDARD 20)
+set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+
+option(TOOLSCREEN_MACOS_BUILD_TESTS "Build the platform-independent unit tests on macOS." ON)
+option(TOOLSCREEN_MACOS_BUILD_LIBLOGGER "Build liblogger.dylib from source alongside the Toolscreen dylib." ON)
+
+set(TOOLSCREEN_ARTIFACT_ROOT "${CMAKE_BINARY_DIR}/bin")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${TOOLSCREEN_ARTIFACT_ROOT}")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${TOOLSCREEN_ARTIFACT_ROOT}")
+
+include(FetchContent)
+
+function(toolscreen_mac_write_if_different file_path content)
+    if(EXISTS "${file_path}")
+        file(READ "${file_path}" existing)
+        if(existing STREQUAL content)
+            return()
+        endif()
+    endif()
+    file(WRITE "${file_path}" "${content}")
+endfunction()
+
+FetchContent_Declare(
+    glew
+    URL https://github.com/nigels-com/glew/releases/download/glew-2.2.0/glew-2.2.0.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui
+    GIT_TAG v1.92.6
+    GIT_SHALLOW TRUE
+)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json
+    GIT_TAG v3.12.0
+    GIT_SHALLOW TRUE
+)
+FetchContent_Declare(
+    cpp_httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib
+    GIT_TAG v0.40.0
+    GIT_SHALLOW TRUE
+)
+
+# Header-only; only needed so shared code that names Vulkan types compiles. The macOS build has no
+# Vulkan backend.
+FetchContent_Declare(
+    vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG v1.4.350
+    GIT_SHALLOW TRUE
+)
+
+foreach(dep glew imgui nlohmann_json cpp_httplib vulkan_headers)
+    FetchContent_GetProperties(${dep})
+    if(NOT ${dep}_POPULATED)
+        FetchContent_Populate(${dep})
+    endif()
+endforeach()
+
+# ---------------------------------------------------------------------------------------------
+# Third-party static libraries
+# ---------------------------------------------------------------------------------------------
+add_library(toolscreen_glew STATIC ${glew_SOURCE_DIR}/src/glew.c)
+target_include_directories(toolscreen_glew PUBLIC ${glew_SOURCE_DIR}/include)
+target_compile_definitions(toolscreen_glew PUBLIC GLEW_STATIC GL_SILENCE_DEPRECATION)
+target_compile_options(toolscreen_glew PRIVATE -w)
+set_target_properties(toolscreen_glew PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set(TOOLSCREEN_IMGUI_DIR "${imgui_SOURCE_DIR}")
+add_library(toolscreen_imgui STATIC
+    ${TOOLSCREEN_IMGUI_DIR}/imgui.cpp
+    ${TOOLSCREEN_IMGUI_DIR}/imgui_draw.cpp
+    ${TOOLSCREEN_IMGUI_DIR}/imgui_tables.cpp
+    ${TOOLSCREEN_IMGUI_DIR}/imgui_widgets.cpp
+    ${TOOLSCREEN_IMGUI_DIR}/imgui_demo.cpp
+    ${TOOLSCREEN_IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
+    ${TOOLSCREEN_IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+)
+target_include_directories(toolscreen_imgui PUBLIC
+    ${TOOLSCREEN_IMGUI_DIR}
+    ${TOOLSCREEN_IMGUI_DIR}/backends
+    ${TOOLSCREEN_IMGUI_DIR}/misc/cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/imgui
+)
+# The OpenGL3 backend resolves GL through GLEW so that the legacy-context entry point aliases
+# installed by src/platform/mac/mac_gl_compat.cpp (APPLE VAOs etc.) are honoured.
+target_compile_definitions(toolscreen_imgui PUBLIC IMGUI_IMPL_OPENGL_LOADER_CUSTOM)
+target_compile_options(toolscreen_imgui PRIVATE -Wno-deprecated-declarations)
+set_source_files_properties(${TOOLSCREEN_IMGUI_DIR}/backends/imgui_impl_opengl3.cpp PROPERTIES
+    COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/imgui/imgui_mac_gl_loader.h")
+target_link_libraries(toolscreen_imgui PUBLIC toolscreen_glew)
+set_target_properties(toolscreen_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------------------------
+# Embedded resources (the Windows build uses resource.rc)
+# ---------------------------------------------------------------------------------------------
+set(TOOLSCREEN_MAC_RESOURCE_SOURCE "${TOOLSCREEN_GENERATED_DIR}/toolscreen_mac_resources.c")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/resource.rc" toolscreen_rc_contents)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/resource.h" toolscreen_resource_h_contents)
+string(REGEX MATCHALL "IDR_[A-Z0-9_]+[ \t]+RCDATA[ \t]+\"[^\"]+\"" toolscreen_rc_entries "${toolscreen_rc_contents}")
+set(toolscreen_res_c "/* Generated by cmake/macos/ToolscreenMacOS.cmake - do not edit. */\n#include <stddef.h>\n\n")
+set(toolscreen_res_table "")
+set(toolscreen_res_deps "")
+foreach(entry IN LISTS toolscreen_rc_entries)
+    string(REGEX REPLACE "^(IDR_[A-Z0-9_]+).*" "\\1" res_name "${entry}")
+    string(REGEX REPLACE ".*\"([^\"]+)\"$" "\\1" res_rel "${entry}")
+    get_filename_component(res_path "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/${res_rel}" ABSOLUTE)
+    string(REGEX MATCH "#define[ \t]+${res_name}[ \t]+([0-9]+)" _m "${toolscreen_resource_h_contents}")
+    set(res_id "${CMAKE_MATCH_1}")
+    if(NOT res_id OR NOT EXISTS "${res_path}")
+        message(FATAL_ERROR "Could not resolve resource ${res_name} (${res_path})")
+    endif()
+    string(APPEND toolscreen_res_c "static const unsigned char k_${res_name}[] = {\n#embed \"${res_path}\"\n};\n")
+    string(APPEND toolscreen_res_table "    { ${res_id}, k_${res_name}, sizeof(k_${res_name}) },\n")
+    list(APPEND toolscreen_res_deps "${res_path}")
+endforeach()
+string(APPEND toolscreen_res_c "\nstruct ToolscreenEmbeddedResource { int id; const unsigned char* data; size_t size; };\n")
+string(APPEND toolscreen_res_c "const struct ToolscreenEmbeddedResource g_toolscreenEmbeddedResources[] = {\n${toolscreen_res_table}    { 0, 0, 0 }\n};\n")
+toolscreen_mac_write_if_different("${TOOLSCREEN_MAC_RESOURCE_SOURCE}" "${toolscreen_res_c}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/resource.rc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/resource.h")
+set_source_files_properties("${TOOLSCREEN_MAC_RESOURCE_SOURCE}" PROPERTIES
+    OBJECT_DEPENDS "${toolscreen_res_deps}"
+    COMPILE_OPTIONS "-std=c23;-Wno-c23-extensions")
+
+# ---------------------------------------------------------------------------------------------
+# Toolscreen dylib
+# ---------------------------------------------------------------------------------------------
+set(TOOLSCREEN_MODULE_DIRS bootstrap common config features gui gui/tabs hooks render runtime testing third_party)
+set(TOOLSCREEN_SOURCES)
+foreach(module_dir IN LISTS TOOLSCREEN_MODULE_DIRS)
+    file(GLOB module_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/${module_dir}/*.cpp")
+    list(APPEND TOOLSCREEN_SOURCES ${module_sources})
+endforeach()
+
+# Windows-only modules. Each has a macOS replacement under src/platform/mac.
+set(TOOLSCREEN_MAC_EXCLUDED_SOURCES
+    features/browser_overlay.cpp      # WebView2
+    features/virtual_camera.cpp       # OBS virtual camera shared memory
+    hooks/hook_chain.cpp              # PE/IAT third-party detour chaining
+    testing/thread_stack_dump.cpp     # DbgHelp
+)
+foreach(excluded IN LISTS TOOLSCREEN_MAC_EXCLUDED_SOURCES)
+    list(REMOVE_ITEM TOOLSCREEN_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/${excluded}")
+endforeach()
+
+file(GLOB TOOLSCREEN_MAC_PLATFORM_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/*.mm"
+)
+
+add_library(Toolscreen SHARED
+    ${TOOLSCREEN_SOURCES}
+    ${TOOLSCREEN_MAC_PLATFORM_SOURCES}
+    ${TOOLSCREEN_MAC_RESOURCE_SOURCE}
+    ${TOOLSCREEN_GENERATED_VERSION_HEADER}
+)
+
+target_include_directories(Toolscreen PRIVATE
+    ${TOOLSCREEN_GENERATED_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/include
+    ${nlohmann_json_SOURCE_DIR}/single_include
+    ${cpp_httplib_SOURCE_DIR}
+    ${vulkan_headers_SOURCE_DIR}/include
+)
+
+target_compile_definitions(Toolscreen PRIVATE
+    TOOLSCREEN_EXPORTS
+    TOOLSCREEN_MACOS
+    CMAKE_BUILD
+    GLEW_STATIC
+    GL_SILENCE_DEPRECATION
+    NOMINMAX
+    UNICODE
+    _UNICODE
+)
+
+# The compatibility header stands in for <windows.h> in every shared translation unit.
+target_compile_options(Toolscreen PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/src/platform/mac/win32_compat.h>
+    -fvisibility=hidden
+    -Wno-deprecated-declarations
+    -Wno-unused-value
+    -Wno-switch
+    -Wno-invalid-offsetof
+    -Wno-format-security
+    -Wno-c++11-narrowing
+    -Wno-microsoft-goto
+    -Wno-nontrivial-memaccess
+    -Wno-unused-result
+    -fms-extensions
+    -ferror-limit=0
+)
+set_source_files_properties(${TOOLSCREEN_MAC_PLATFORM_SOURCES} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+foreach(src IN LISTS TOOLSCREEN_MAC_PLATFORM_SOURCES)
+    if(src MATCHES "\\.cpp$")
+        set_source_files_properties(${src} PROPERTIES COMPILE_OPTIONS "")
+    endif()
+endforeach()
+
+target_link_libraries(Toolscreen PRIVATE
+    toolscreen_imgui
+    toolscreen_glew
+    "-framework AppKit"
+    "-framework Carbon"
+    "-framework CoreFoundation"
+    "-framework CoreGraphics"
+    "-framework CoreServices"
+    "-framework Foundation"
+    "-framework IOKit"
+    "-framework OpenGL"
+    "-framework QuartzCore"
+    "-framework UniformTypeIdentifiers"
+)
+
+set_target_properties(Toolscreen PROPERTIES
+    OUTPUT_NAME "Toolscreen"
+    INSTALL_NAME_DIR "@rpath"
+    BUILD_WITH_INSTALL_NAME_DIR ON
+)
+
+add_custom_command(TARGET Toolscreen POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:Toolscreen>/fonts"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/fonts/Monocraft.ttf"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/fonts/Minecraft.ttf"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/assets/fonts/OpenSans-Regular.ttf"
+        "$<TARGET_FILE_DIR:Toolscreen>/fonts/"
+    COMMENT "Copying bundled fonts to output directory"
+)
+
+# ---------------------------------------------------------------------------------------------
+# liblogger (macOS universal dylib; see liblogger/build-macos.sh)
+# ---------------------------------------------------------------------------------------------
+if(TOOLSCREEN_MACOS_BUILD_LIBLOGGER)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/liblogger/LibLoggerVersion.cmake" OPTIONAL)
+    if(NOT DEFINED LIBLOGGER_VERSION_MAJOR)
+        set(LIBLOGGER_VERSION_MAJOR 1)
+        set(LIBLOGGER_VERSION_MINOR 1)
+        set(LIBLOGGER_VERSION_PATCH 1)
+    endif()
+    find_package(JNI QUIET COMPONENTS JVM)
+    if(JNI_INCLUDE_DIRS)
+        add_library(liblogger SHARED "${CMAKE_CURRENT_SOURCE_DIR}/liblogger/Mac.cpp")
+        set_target_properties(liblogger PROPERTIES OUTPUT_NAME "logger" CXX_STANDARD 17 INSTALL_NAME_DIR "@rpath"
+            BUILD_WITH_INSTALL_NAME_DIR ON)
+        target_include_directories(liblogger PRIVATE ${JNI_INCLUDE_DIRS})
+        target_compile_definitions(liblogger PRIVATE
+            "LIBLOGGER_VERSION_STR=\"${LIBLOGGER_VERSION_MAJOR}.${LIBLOGGER_VERSION_MINOR}.${LIBLOGGER_VERSION_PATCH}\"")
+        target_compile_options(liblogger PRIVATE -fno-exceptions -fno-rtti -fvisibility=hidden -Wno-deprecated-declarations)
+        target_link_libraries(liblogger PRIVATE "-framework CoreFoundation" "-framework Security")
+    else()
+        message(WARNING "JDK headers not found; liblogger.dylib will not be built (set JAVA_HOME).")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------------------------
+# Platform-independent unit tests
+# ---------------------------------------------------------------------------------------------
+if(TOOLSCREEN_MACOS_BUILD_TESTS)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/ToolscreenMacOSTests.cmake" OPTIONAL)
+endif()
