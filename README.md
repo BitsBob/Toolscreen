@@ -5,7 +5,7 @@
 
 A screen mirroring and overlay tool for Minecraft Java Edition speedrunning. Resize your game, add overlays, and use EyeZoom — all without OBS projectors or leaving fullscreen.
 
-> **Windows 10/11 only** · Fully legal for [speedrun.com](https://www.speedrun.com/mc) and [MCSR Ranked](https://mcsrranked.com/)
+> **Windows 10/11 and macOS** ([macOS guide](docs/macos.md)) · Fully legal for [speedrun.com](https://www.speedrun.com/mc) and [MCSR Ranked](https://mcsrranked.com/)
 
 <p align="center">
   <img src="docs/images/screenshot.png" alt="Toolscreen screenshot" width="800">
@@ -23,7 +23,7 @@ A screen mirroring and overlay tool for Minecraft Java Edition speedrunning. Res
 
 ## Requirements
 
-- **Windows 10 or 11** (x64 or ARM64; macOS/Linux are not supported)
+- **Windows 10 or 11** (x64 or ARM64), or **macOS 13.3+** (Apple Silicon or Intel; see the [macOS guide](docs/macos.md))
 - **Java 17+** (needed to run the installer)
 - **Minecraft Java Edition**
 - **Supported launchers:** Prism Launcher, MultiMC, MCSRLauncher
@@ -48,6 +48,12 @@ You can download either the `.exe` or the `.jar` installer — both do the same 
 
 > If your antivirus blocks the install, temporarily disable it and try again. Toolscreen uses DLL injection which may trigger false positives.
 5. Launch Minecraft and look for the Toolscreen popup in the top-left corner
+
+### macOS
+
+Build with `./build-macos.sh` (or use a macOS release zip), then run `./install-macos.sh` and pick your Prism
+Launcher / MultiMC instance. It adds Toolscreen to the instance's JVM arguments as a `-agentpath`. Full details,
+supported features and troubleshooting: [docs/macos.md](docs/macos.md).
 
 ## Configuration
 
