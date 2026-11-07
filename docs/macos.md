@@ -107,6 +107,14 @@ Requirements: Xcode or the Command Line Tools, CMake ≥ 3.21, Ninja (`brew inst
   ```
 
   Results are JSON lines; Vulkan-, SDL- and fixture-specific tests report `skip`.
+* Rendering diagnostics (developer aids, off unless set):
+  * `TOOLSCREEN_MAC_DEBUG_GLSTATE=1` logs any OpenGL state Toolscreen's per-frame work leaves changed.
+    Minecraft's `GlStateManager` and Sodium cache GL state, so any line it prints is a bug.
+  * `TOOLSCREEN_MAC_DEBUG_SCRIPT` drives the game and saves frames without anyone at the keyboard, e.g.
+    `TOOLSCREEN_MAC_DEBUG_DIR=/tmp/ts TOOLSCREEN_MAC_DEBUG_SCRIPT="12 capture title; 13 click 0.5 0.41; 40 gui 1; 43 capture gui; 45 quit"`.
+    Steps are `<seconds after the window opened> <command>`: `capture NAME` (PNG of the presented frame),
+    `click X Y` (fractions of the window), `key GLFW_KEY`, `text STRING`, `gui 0|1`, `quit`. While a script
+    is set the game cannot capture the system mouse cursor.
 
 ## Troubleshooting
 

@@ -31,6 +31,10 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------------------------
 // Symbols provided by bootstrap/dllmain.cpp (shared with the Windows build)
@@ -71,6 +75,7 @@ extern GLFWSETFRAMEBUFFERSIZECALLBACK oglfwSetFramebufferSizeCallback;
 extern std::atomic<GLFWGETCURRENTCONTEXTPROC> glfwGetCurrentContextProc;
 extern GETRAWINPUTDATAPROC oGetRawInputData;
 extern std::atomic<bool> g_glBlitFramebufferHooked;
+extern std::atomic<bool> g_showGui;
 
 BOOL WINAPI hkwglSwapBuffers(HDC hDc);
 BOOL WINAPI hkSetCursorPos(int X, int Y);
@@ -663,8 +668,18 @@ void Orig_DestroyWindow(void* window) {
     if (g_real.destroyWindow) g_real.destroyWindow(window);
 }
 
+bool DebugScriptActive() {
+    static const bool active = [] {
+        const char* v = getenv("TOOLSCREEN_MAC_DEBUG_SCRIPT");
+        return v && *v;
+    }();
+    return active;
+}
+
 void Orig_SetInputMode(void* window, int mode, int value) {
-    if (g_real.setInputMode) g_real.setInputMode(window, mode, value);
+    // A scripted debug run must not capture the mouse of whoever is using the Mac meanwhile.
+    const bool keepSystemCursor = DebugScriptActive() && IsGameWindow(window) && mode == kGlfwCursor && value == kGlfwCursorDisabled;
+    if (g_real.setInputMode && !keepSystemCursor) g_real.setInputMode(window, mode, value);
     if (!IsGameWindow(window) || mode != kGlfwCursor) return;
     const int previous = g_bridge.cursorMode;
     g_bridge.cursorMode = value;
@@ -682,8 +697,279 @@ void* Hk_CreateWindow(int width, int height, const char* title, void* monitor, v
     return hkglfwCreateWindow(width, height, title, monitor, share);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Developer automation for reproducing rendering problems without anyone at the keyboard.
+//
+//   TOOLSCREEN_MAC_DEBUG_DIR=/tmp/ts TOOLSCREEN_MAC_DEBUG_SCRIPT="8 capture title; 9 click 0.5 0.45; 30 gui 1; 32 capture gui"
+//
+// Each step is "<seconds after the game window opened> <command> [arguments]":
+//   capture NAME   PNG of the next frame exactly as presented (after Toolscreen drew), in DEBUG_DIR
+//   click X Y      left click at a position given as fractions of the window size
+//   key CODE       press and release a GLFW key code
+//   text STRING    type characters
+//   gui 0|1        close / open the Toolscreen settings GUI
+//   quit           ask the game to close
+// While a script is set, the game cannot capture (hide and lock) the system mouse cursor.
+// Input goes through the same bridge as real GLFW events, so Toolscreen sees it first.
+// ---------------------------------------------------------------------------------------------
+struct DebugStep {
+    double at = 0.0;
+    std::string command;
+    std::string args;
+};
+
+struct DebugScriptState {
+    bool parsed = false;
+    std::vector<DebugStep> steps;
+    size_t next = 0;
+    std::chrono::steady_clock::time_point start{};
+    bool started = false;
+    std::string dir;
+    std::string pendingCapture; // file to write on the next presented frame
+    int pendingMouseRelease = -1;
+    int pendingKeyRelease = -1;
+};
+DebugScriptState g_debugScript;
+
+void ParseDebugScript() {
+    g_debugScript.parsed = true;
+    const char* script = getenv("TOOLSCREEN_MAC_DEBUG_SCRIPT");
+    const char* dir = getenv("TOOLSCREEN_MAC_DEBUG_DIR");
+    if (!script || !*script) return;
+    g_debugScript.dir = (dir && *dir) ? dir : "/tmp";
+    std::string all = script;
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        size_t end = all.find(';', pos);
+        if (end == std::string::npos) end = all.size();
+        std::string item = all.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t first = item.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        item = item.substr(first);
+        char* after = nullptr;
+        const double at = std::strtod(item.c_str(), &after);
+        std::string rest = after ? std::string(after) : std::string();
+        rest.erase(0, rest.find_first_not_of(" \t"));
+        const size_t space = rest.find(' ');
+        DebugStep step;
+        step.at = at;
+        step.command = rest.substr(0, space);
+        step.args = space == std::string::npos ? std::string() : rest.substr(space + 1);
+        g_debugScript.steps.push_back(step);
+    }
+    std::stable_sort(g_debugScript.steps.begin(), g_debugScript.steps.end(),
+                     [](const DebugStep& a, const DebugStep& b) { return a.at < b.at; });
+    Log("[macOS] Debug script loaded with " + std::to_string(g_debugScript.steps.size()) + " steps.");
+}
+
+void RunDebugStep(GLFWwindow* window, const DebugStep& step) {
+    Log("[macOS] Debug script: " + step.command + " " + step.args);
+    if (step.command == "capture") {
+        g_debugScript.pendingCapture = g_debugScript.dir + "/" + (step.args.empty() ? std::string("frame") : step.args) + ".png";
+    } else if (step.command == "click") {
+        double fx = 0.5, fy = 0.5;
+        sscanf(step.args.c_str(), "%lf %lf", &fx, &fy);
+        int w = 0, h = 0;
+        if (g_real.getWindowSize) g_real.getWindowSize(window, &w, &h);
+        Bridge_CursorPos(window, fx * w, fy * h);
+        Bridge_MouseButton(window, 0, GLFW_PRESS_, 0);
+        g_debugScript.pendingMouseRelease = 0;
+    } else if (step.command == "key") {
+        const int key = std::atoi(step.args.c_str());
+        const KeyEntry* entry = FindByGlfwKey(key);
+        Bridge_Key(window, key, entry ? entry->macKeyCode : 0, GLFW_PRESS_, 0);
+        g_debugScript.pendingKeyRelease = key;
+    } else if (step.command == "text") {
+        for (unsigned char c : step.args) Bridge_CharMods(window, c, 0);
+    } else if (step.command == "gui") {
+        g_showGui.store(std::atoi(step.args.c_str()) != 0, std::memory_order_release);
+    } else if (step.command == "quit") {
+        if (g_real.setWindowShouldClose) g_real.setWindowShouldClose(window, 1);
+    }
+}
+
+void PumpDebugScript() {
+    if (!g_debugScript.parsed) ParseDebugScript();
+    GLFWwindow* window = static_cast<void*>(macwin::GameHwnd());
+    if (g_debugScript.steps.empty() || !window) return;
+    if (!g_debugScript.started) {
+        g_debugScript.start = std::chrono::steady_clock::now();
+        g_debugScript.started = true;
+    }
+    if (g_debugScript.pendingMouseRelease >= 0) {
+        Bridge_MouseButton(window, g_debugScript.pendingMouseRelease, GLFW_RELEASE_, 0);
+        g_debugScript.pendingMouseRelease = -1;
+    }
+    if (g_debugScript.pendingKeyRelease >= 0) {
+        const KeyEntry* entry = FindByGlfwKey(g_debugScript.pendingKeyRelease);
+        Bridge_Key(window, g_debugScript.pendingKeyRelease, entry ? entry->macKeyCode : 0, GLFW_RELEASE_, 0);
+        g_debugScript.pendingKeyRelease = -1;
+    }
+    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_debugScript.start).count();
+    while (g_debugScript.next < g_debugScript.steps.size() && g_debugScript.steps[g_debugScript.next].at <= elapsed) {
+        RunDebugStep(window, g_debugScript.steps[g_debugScript.next++]);
+    }
+}
+
+// TOOLSCREEN_MAC_DEBUG_GLSTATE=1 logs any OpenGL state Toolscreen's per-frame work leaves changed.
+// Minecraft (GlStateManager) and Sodium cache much of this state, so a leak corrupts their rendering.
+struct GlStateProbe {
+    std::vector<std::pair<std::string, GLint>> values;
+};
+
+GlStateProbe ProbeGlState(bool legacy) {
+    GlStateProbe p;
+    auto geti = [&](const char* name, GLenum e) {
+        GLint v[4] = {};
+        glGetIntegerv(e, v);
+        p.values.emplace_back(name, v[0]);
+    };
+    auto en = [&](const char* name, GLenum e) { p.values.emplace_back(name, glIsEnabled(e) ? 1 : 0); };
+    geti("program", GL_CURRENT_PROGRAM);
+    geti("vao", GL_VERTEX_ARRAY_BINDING);
+    geti("arrayBuffer", GL_ARRAY_BUFFER_BINDING);
+    geti("elementBuffer", GL_ELEMENT_ARRAY_BUFFER_BINDING);
+    geti("unpackBuffer", GL_PIXEL_UNPACK_BUFFER_BINDING);
+    geti("packBuffer", GL_PIXEL_PACK_BUFFER_BINDING);
+    geti("drawFb", GL_DRAW_FRAMEBUFFER_BINDING);
+    geti("readFb", GL_READ_FRAMEBUFFER_BINDING);
+    geti("activeTexture", GL_ACTIVE_TEXTURE);
+    GLint active = GL_TEXTURE0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (int unit = 0; unit < 4; ++unit) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        const std::string u = std::to_string(unit);
+        geti(("tex2D[" + u + "]").c_str(), GL_TEXTURE_BINDING_2D);
+        if (legacy) {
+            en(("enableTex2D[" + u + "]").c_str(), GL_TEXTURE_2D);
+            GLint envMode = 0;
+            glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &envMode);
+            p.values.emplace_back("texEnvMode[" + u + "]", envMode);
+        }
+    }
+    glActiveTexture(static_cast<GLenum>(active));
+    if (legacy) {
+        geti("clientActiveTexture", GL_CLIENT_ACTIVE_TEXTURE);
+        geti("matrixMode", GL_MATRIX_MODE);
+        geti("shadeModel", GL_SHADE_MODEL);
+        en("alphaTest", GL_ALPHA_TEST);
+        en("lighting", GL_LIGHTING);
+        en("fog", GL_FOG);
+        en("colorMaterial", GL_COLOR_MATERIAL);
+        en("vertexArray", GL_VERTEX_ARRAY);
+        en("colorArray", GL_COLOR_ARRAY);
+        en("texCoordArray", GL_TEXTURE_COORD_ARRAY);
+        GLfloat color[4] = {};
+        glGetFloatv(GL_CURRENT_COLOR, color);
+        p.values.emplace_back("currentColorR*1000", static_cast<GLint>(color[0] * 1000));
+        p.values.emplace_back("currentColorA*1000", static_cast<GLint>(color[3] * 1000));
+    }
+    for (GLuint i = 0; i < 8; ++i) {
+        GLint enabled = 0, buffer = 0, divisor = 0;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &buffer);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_DIVISOR_ARB, &divisor);
+        const std::string n = std::to_string(i);
+        p.values.emplace_back("attrib[" + n + "].enabled", enabled);
+        p.values.emplace_back("attrib[" + n + "].buffer", buffer);
+        p.values.emplace_back("attrib[" + n + "].divisor", divisor);
+    }
+    en("blend", GL_BLEND);
+    en("depthTest", GL_DEPTH_TEST);
+    en("cullFace", GL_CULL_FACE);
+    en("scissorTest", GL_SCISSOR_TEST);
+    en("stencilTest", GL_STENCIL_TEST);
+    en("polygonOffsetFill", GL_POLYGON_OFFSET_FILL);
+    geti("blendSrcRgb", GL_BLEND_SRC_RGB);
+    geti("blendDstRgb", GL_BLEND_DST_RGB);
+    geti("blendSrcAlpha", GL_BLEND_SRC_ALPHA);
+    geti("blendDstAlpha", GL_BLEND_DST_ALPHA);
+    geti("blendEquation", GL_BLEND_EQUATION_RGB);
+    geti("depthFunc", GL_DEPTH_FUNC);
+    geti("depthMask", GL_DEPTH_WRITEMASK);
+    geti("cullFaceMode", GL_CULL_FACE_MODE);
+    geti("frontFace", GL_FRONT_FACE);
+    geti("polygonMode", GL_POLYGON_MODE);
+    geti("unpackAlignment", GL_UNPACK_ALIGNMENT);
+    geti("unpackRowLength", GL_UNPACK_ROW_LENGTH);
+    geti("unpackSkipRows", GL_UNPACK_SKIP_ROWS);
+    geti("unpackSkipPixels", GL_UNPACK_SKIP_PIXELS);
+    geti("packAlignment", GL_PACK_ALIGNMENT);
+    geti("drawBuffer", GL_DRAW_BUFFER);
+    geti("readBuffer", GL_READ_BUFFER);
+    GLint vp[4] = {};
+    glGetIntegerv(GL_VIEWPORT, vp);
+    p.values.emplace_back("viewport", vp[0] * 1000003 + vp[1] * 10007 + vp[2] * 101 + vp[3]);
+    GLboolean colorMask[4] = {};
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    p.values.emplace_back("colorMask", colorMask[0] | (colorMask[1] << 1) | (colorMask[2] << 2) | (colorMask[3] << 3));
+    return p;
+}
+
+void LogGlStateDifferences(const GlStateProbe& before, const GlStateProbe& after) {
+    static int s_reports = 0;
+    if (s_reports >= 40) return;
+    std::string diff;
+    for (size_t i = 0; i < before.values.size() && i < after.values.size(); ++i) {
+        if (before.values[i].second != after.values[i].second) {
+            diff += " " + before.values[i].first + "=" + std::to_string(before.values[i].second) + "->" +
+                    std::to_string(after.values[i].second);
+        }
+    }
+    if (diff.empty()) return;
+    ++s_reports;
+    Log("[macOS] GL state changed by Toolscreen's frame:" + diff);
+}
+
+bool DebugGlStateEnabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("TOOLSCREEN_MAC_DEBUG_GLSTATE");
+        return v && *v && *v != '0';
+    }();
+    return enabled;
+}
+
+// Reads the composed back buffer just before it is presented.
+void CapturePresentedFrame(GLFWwindow* window, const std::string& path) {
+    int w = 0, h = 0;
+    if (g_real.getFramebufferSize) g_real.getFramebufferSize(window, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    GLint readFb = 0, readBuffer = 0, packBuffer = 0, packAlignment = 4, packRowLength = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFb);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &packBuffer);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &packAlignment);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &packRowLength);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glGetIntegerv(GL_READ_BUFFER, &readBuffer);
+    glReadBuffer(GL_BACK);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glReadBuffer(readBuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFb);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, packBuffer);
+    glPixelStorei(GL_PACK_ALIGNMENT, packAlignment);
+    glPixelStorei(GL_PACK_ROW_LENGTH, packRowLength);
+
+    const size_t row = static_cast<size_t>(w) * 4;
+    std::vector<uint8_t> flipped(pixels.size());
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(&flipped[static_cast<size_t>(y) * row], &pixels[static_cast<size_t>(h - 1 - y) * row], row);
+        for (size_t x = 3; x < row; x += 4) flipped[static_cast<size_t>(y) * row + x] = 255;
+    }
+    const bool ok = MacBridge_WritePNG(path.c_str(), flipped.data(), w, h) != 0;
+    Log(std::string("[macOS] Debug capture ") + (ok ? "written: " : "FAILED: ") + path);
+}
+
 // Real-swap target for SwapBuffersHook_Impl.
 BOOL WINAPI Orig_SwapBuffers(HDC dc) {
+    if (!g_debugScript.pendingCapture.empty() && IsGameWindow(static_cast<void*>(dc))) {
+        CapturePresentedFrame(static_cast<void*>(dc), g_debugScript.pendingCapture);
+        g_debugScript.pendingCapture.clear();
+    }
     if (g_real.swapBuffers) g_real.swapBuffers(static_cast<void*>(dc));
     return TRUE;
 }
@@ -708,17 +994,24 @@ void Hk_SwapBuffers(GLFWwindow* window) {
         g_bridge.legacyContext = CurrentContextIsLegacy();
         g_bridge.legacyContextKnown = true;
     }
+    // GLEW is initialised inside Toolscreen's first swap; probe from the frame after.
+    const bool probe = DebugGlStateEnabled() && glActiveTexture && glGetVertexAttribiv;
+    GlStateProbe before;
+    if (probe) before = ProbeGlState(g_bridge.legacyContext);
+
     const bool restoreAlphaTest = g_bridge.legacyContext && glIsEnabled(GL_ALPHA_TEST);
     if (restoreAlphaTest) glDisable(GL_ALPHA_TEST);
 
     hkwglSwapBuffers(reinterpret_cast<HDC>(window));
 
     if (restoreAlphaTest) glEnable(GL_ALPHA_TEST);
+    if (probe) LogGlStateDifferences(before, ProbeGlState(g_bridge.legacyContext));
 }
 
 void Hk_PollEvents() {
     macwin::PumpGameWindowMessages();
     if (g_real.pollEvents) g_real.pollEvents();
+    PumpDebugScript();
     macwin::PumpGameWindowMessages();
 }
 

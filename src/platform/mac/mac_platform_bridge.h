@@ -119,6 +119,10 @@ int MacBridge_IsMainThread(void);
 // Wakes the Cocoa event loop so that glfwWaitEvents/glfwPollEvents return promptly.
 void MacBridge_PostEmptyEvent(void);
 
+// ----- Diagnostics ------------------------------------------------------------------------------
+// Writes top-down RGBA pixels as a PNG file. Returns false on failure.
+int MacBridge_WritePNG(const char* path, const uint8_t* rgba, int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

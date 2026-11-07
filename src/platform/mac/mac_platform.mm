@@ -695,4 +695,24 @@ void MacBridge_PostEmptyEvent(void) {
     });
 }
 
+int MacBridge_WritePNG(const char* path, const uint8_t* rgba, int width, int height) {
+    if (!path || !rgba || width <= 0 || height <= 0) return 0;
+    @autoreleasepool {
+        NSBitmapImageRep* rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:nullptr
+                                                                        pixelsWide:width
+                                                                        pixelsHigh:height
+                                                                     bitsPerSample:8
+                                                                   samplesPerPixel:4
+                                                                          hasAlpha:YES
+                                                                          isPlanar:NO
+                                                                    colorSpaceName:NSDeviceRGBColorSpace
+                                                                       bytesPerRow:static_cast<NSInteger>(width) * 4
+                                                                      bitsPerPixel:32];
+        if (!rep) return 0;
+        std::memcpy([rep bitmapData], rgba, static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+        NSData* png = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
+        return png && [png writeToFile:[NSString stringWithUTF8String:path] atomically:YES] ? 1 : 0;
+    }
+}
+
 } // extern "C"

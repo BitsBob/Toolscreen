@@ -168,19 +168,28 @@ void ToolscreenOnGlewInitialized() {
     LogCategory("init", std::string("[RENDER][macOS] OpenGL ") + (version ? version : "?") + " on " + (renderer ? renderer : "?") +
                             (legacy ? " (legacy 2.1 context: translating shaders to GLSL 1.20)" : ""));
 
+    // OpenGL.framework exports every GL 3.x/4.x entry point whatever the context supports, so GLEW
+    // resolves them all to non-null pointers. In a context that lacks the feature (the legacy 2.1
+    // context lacks everything past 2.1; the 4.1 core context lacks 4.2+) the call does nothing but
+    // raise GL_INVALID_OPERATION. Select by what the context reports instead of by pointer.
     if (legacy) {
-        if (!glGenVertexArrays && glGenVertexArraysAPPLE) {
+        // Vertex array objects exist only as APPLE_vertex_array_object here. Without this, every
+        // glGenVertexArrays returns 0 and Toolscreen's (and Dear ImGui's) vertex attribute setup lands
+        // in Minecraft's default vertex array.
+        if (glGenVertexArraysAPPLE && glBindVertexArrayAPPLE && glDeleteVertexArraysAPPLE) {
             glGenVertexArrays = reinterpret_cast<PFNGLGENVERTEXARRAYSPROC>(glGenVertexArraysAPPLE);
             glBindVertexArray = reinterpret_cast<PFNGLBINDVERTEXARRAYPROC>(glBindVertexArrayAPPLE);
             glDeleteVertexArrays = reinterpret_cast<PFNGLDELETEVERTEXARRAYSPROC>(glDeleteVertexArraysAPPLE);
             glIsVertexArray = reinterpret_cast<PFNGLISVERTEXARRAYPROC>(glIsVertexArrayAPPLE);
+        } else {
+            LogCategory("init", "[RENDER][macOS] WARNING: APPLE_vertex_array_object is unavailable.");
         }
-        if (!glVertexAttribDivisor && glVertexAttribDivisorARB) glVertexAttribDivisor = reinterpret_cast<PFNGLVERTEXATTRIBDIVISORPROC>(glVertexAttribDivisorARB);
-        if (!glDrawArraysInstanced && glDrawArraysInstancedARB) glDrawArraysInstanced = reinterpret_cast<PFNGLDRAWARRAYSINSTANCEDPROC>(glDrawArraysInstancedARB);
-        if (!glDrawElementsInstanced && glDrawElementsInstancedARB) glDrawElementsInstanced = reinterpret_cast<PFNGLDRAWELEMENTSINSTANCEDPROC>(glDrawElementsInstancedARB);
-        if (!glMapBufferRange) glMapBufferRange = MapBufferRangeFallback;
+        if (glVertexAttribDivisorARB) glVertexAttribDivisor = reinterpret_cast<PFNGLVERTEXATTRIBDIVISORPROC>(glVertexAttribDivisorARB);
+        if (glDrawArraysInstancedARB) glDrawArraysInstanced = reinterpret_cast<PFNGLDRAWARRAYSINSTANCEDPROC>(glDrawArraysInstancedARB);
+        if (glDrawElementsInstancedARB) glDrawElementsInstanced = reinterpret_cast<PFNGLDRAWELEMENTSINSTANCEDPROC>(glDrawElementsInstancedARB);
+        if (!GLEW_ARB_map_buffer_range) glMapBufferRange = MapBufferRangeFallback;
     }
-    if (!glBindSampler) glBindSampler = NoopBindSampler;
-    if (!glMemoryBarrier) glMemoryBarrier = NoopMemoryBarrier;
-    if (!glTexStorage2D) glTexStorage2D = TexStorage2DFallback;
+    if (!glBindSampler || !(GLEW_VERSION_3_3 || GLEW_ARB_sampler_objects)) glBindSampler = NoopBindSampler;
+    if (!glMemoryBarrier || !(GLEW_VERSION_4_2 || GLEW_ARB_shader_image_load_store)) glMemoryBarrier = NoopMemoryBarrier;
+    if (!glTexStorage2D || !(GLEW_VERSION_4_2 || GLEW_ARB_texture_storage)) glTexStorage2D = TexStorage2DFallback;
 }
